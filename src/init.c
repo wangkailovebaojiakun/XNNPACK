@@ -13,10 +13,6 @@
 
 #include <pthread.h>
 
-#ifndef __EMSCRIPTEN__
-  #include <cpuinfo.h>
-#endif
-
 #include <xnnpack.h>
 #include <xnnpack/argmaxpool.h>
 #include <xnnpack/avgpool.h>
@@ -46,6 +42,10 @@
 #include <xnnpack/vmulcaddc.h>
 #include <xnnpack/vunary.h>
 #include <xnnpack/zip.h>
+
+#if !XNN_PLATFORM_WEB
+  #include <cpuinfo.h>
+#endif
 
 #ifndef XNN_ENABLE_ASSEMBLY
   #define XNN_ENABLE_ASSEMBLY 1
@@ -1707,13 +1707,12 @@ static void init(void) {
 }
 
 enum xnn_status xnn_initialize(const struct xnn_allocator* allocator) {
-  #ifndef __EMSCRIPTEN__
+  #if !XNN_PLATFORM_WEB
     if (!cpuinfo_initialize()) {
       return xnn_status_out_of_memory;
     }
   #endif
-  pthread_once(&init_guard, &init);
-  if (xnn_params.initialized) {
+  if (!xnn_params.initialized) {
     if (allocator != NULL) {
       memcpy(&xnn_params.allocator, allocator, sizeof(struct xnn_allocator));
     } else {
@@ -1723,6 +1722,41 @@ enum xnn_status xnn_initialize(const struct xnn_allocator* allocator) {
       xnn_params.allocator.aligned_allocate = &xnn_aligned_allocate;
       xnn_params.allocator.aligned_deallocate = &xnn_aligned_deallocate;
     }
+    #if XNN_PLATFORM_WEB
+      // Unlike most other architectures, on x86/x86-64 when floating-point instructions
+      // have no NaN arguments, but produce NaN output, the output NaN has sign bit set.
+      // We use it to distinguish x86/x86-64 from other architectures, by doing subtraction
+      // of two infinities (must produce NaN per IEEE 754 standard).
+      static volatile uint32_t minus_inf = UINT32_C(0xFF800000);
+      const bool is_wasm_x86 = (int32_t) xnn_stub_wasm_f32_sub(minus_inf, minus_inf) < 0;
+      if (is_wasm_x86) {
+        // Assume x86 processors have 2MB L3 cache.
+        // This is a conservative estimate based on Intel Braswell, a popular low-end x86 core.
+        xnn_params.llc_size = 2 * 1024 * 1024;
+      } else {
+        // Assume ARM processors have 512K L3 cache.
+        // This is a conservative estimate based on Snapdragon 410, a popular low-end ARM SoC.
+        xnn_params.llc_size = 512 * 1024;
+      }
+    #else
+      const struct cpuinfo_processor* processor = cpuinfo_get_processor(0);
+      if (processor != NULL) {
+        if (processor->cache.l3 != NULL) {
+          xnn_params.llc_size = processor->cache.l3->size;
+        } else if (processor->cache.l2 != NULL) {
+          xnn_params.llc_size = processor->cache.l2->size;
+        } else {
+          // Safe default: 256K
+          xnn_params.llc_size = 256 * 1024;
+        }
+      } else {
+        // Safe default: 256K
+        xnn_params.llc_size = 256 * 1024;
+      }
+    #endif
+  }
+  pthread_once(&init_guard, &init);
+  if (xnn_params.initialized) {
     return xnn_status_success;
   } else {
     return xnn_status_unsupported_hardware;
@@ -1730,7 +1764,7 @@ enum xnn_status xnn_initialize(const struct xnn_allocator* allocator) {
 }
 
 enum xnn_status xnn_deinitialize(void) {
-  #ifndef __EMSCRIPTEN__
+  #if !XNN_PLATFORM_WEB
     cpuinfo_deinitialize();
   #endif
   return xnn_status_success;
